@@ -131,9 +131,11 @@ CREATE INDEX idx_properties_city ON properties(city);
 CREATE INDEX idx_properties_price ON properties(price_monthly);
 CREATE INDEX idx_properties_rooms ON properties(rooms);
 CREATE INDEX idx_properties_available_from ON properties(available_from);
-CREATE INDEX idx_properties_location ON properties USING GIST (ll_to_earth(latitude, longitude));
 CREATE INDEX idx_properties_features ON properties USING GIN (features);
 CREATE INDEX idx_properties_created_at ON properties(created_at DESC);
+
+-- Note: Geolocation index is added separately after creating the geography column
+-- See the "Geolocation Setup" section below for proper PostGIS implementation
 
 -- Full-text search index
 CREATE INDEX idx_properties_search ON properties USING GIN (
@@ -644,6 +646,58 @@ CREATE POLICY "Users can delete their own avatar"
 
 ---
 
+## Geolocation Setup (Optional)
+
+The properties table includes `latitude` and `longitude` columns for storing coordinates. For proximity searches and map features, you can add PostGIS geolocation support with the following migration:
+
+```sql
+-- Ensure PostGIS extension is enabled
+CREATE EXTENSION IF NOT EXISTS "postgis";
+
+-- Add a generated geography Point column using longitude/latitude
+ALTER TABLE properties
+  ADD COLUMN location geography(Point, 4326)
+  GENERATED ALWAYS AS (
+    CASE 
+      WHEN latitude IS NOT NULL AND longitude IS NOT NULL 
+      THEN ST_SetSRID(ST_MakePoint(longitude::double precision, latitude::double precision), 4326)::geography
+      ELSE NULL
+    END
+  ) STORED;
+
+-- Create a spatial index on the geography point
+CREATE INDEX idx_properties_location ON properties USING GIST (location);
+
+-- Optional: Add coordinate validation constraints
+ALTER TABLE properties
+  ADD CONSTRAINT chk_properties_coords
+  CHECK (
+    (latitude IS NULL AND longitude IS NULL) OR
+    (latitude BETWEEN -90 AND 90 AND longitude BETWEEN -180 AND 180)
+  );
+```
+
+**Usage Example - Find properties within 5km radius:**
+
+```sql
+SELECT id, title, address, city
+FROM properties
+WHERE location IS NOT NULL
+  AND ST_DWithin(
+    location,
+    ST_SetSRID(ST_MakePoint($longitude::double precision, $latitude::double precision), 4326)::geography,
+    5000  -- 5000 meters = 5km
+  )
+  AND status = 'active'
+  AND deleted_at IS NULL
+ORDER BY location <-> ST_SetSRID(ST_MakePoint($longitude::double precision, $latitude::double precision), 4326)::geography
+LIMIT 20;
+```
+
+**Note:** This geolocation setup is optional and not included in the initial migration. Add it when you're ready to implement map features or proximity search.
+
+---
+
 ## Indexes Summary
 
 Key indexes for performance:
@@ -655,8 +709,8 @@ Key indexes for performance:
    - `idx_properties_features` - GIN index for JSONB feature filtering
    - `idx_properties_search` - Full-text search on title/description
 
-2. **Geolocation**
-   - `idx_properties_location` - GIST index for proximity searches
+2. **Geolocation** (Optional - see Geolocation Setup section)
+   - `idx_properties_location` - GIST index for proximity searches (when added)
 
 3. **Performance**
    - `idx_properties_created_at` - Sorting by newest listings
